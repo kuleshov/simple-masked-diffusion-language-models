@@ -103,7 +103,7 @@ class RandomMaskingCollator(DataCollatorForLanguageModeling):
         # The remaining masked tokens (masked_indices & ~indices_replaced) keep their original IDs.
         
         # Store per-sequence probabilities for later use
-        self._current_batch_probs = prob_vector.detach().cpu().tolist()
+        self._current_batch_probs = prob_vector
 
         return inputs, labels
 
@@ -114,14 +114,6 @@ class RandomMaskingCollator(DataCollatorForLanguageModeling):
            as a Python list and as a float tensor for direct model access.
         """
         batch = super().__call__(examples)
-
-        # (A) As a Python list
         batch["masking_probabilities"] = self._current_batch_probs
-        # (B) As a float tensor (so the model can read it easily if desired)
-        batch["mask_probabilities_tensor"] = torch.tensor(
-            self._current_batch_probs,
-            dtype=torch.float,
-            device=batch["input_ids"].device
-        )
 
         return batch

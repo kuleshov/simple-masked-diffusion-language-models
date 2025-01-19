@@ -1,17 +1,13 @@
 import numpy as np
+import torch
 import torch.nn.functional as F
 from transformers import EvalPrediction
 
-def compute_metrics(eval_pred: EvalPrediction):
+def compute_likelihoods(logits, label_ids, mask_probs):
     """
     Computes MDLM likelihood and perplexity during training.
     We expect eval_pred.inputs to be an EvalInputs object.
     """
-    logits = eval_pred.predictions 
-    label_ids = eval_pred.label_ids
-    eval_inputs = eval_pred.inputs  # type: EvalInputs
-    mask_probs = eval_inputs.masking_probabilities  # shape [batch_size] or None
-
     if logits is None or label_ids is None or mask_probs is None:
         return {"likelihood": -1.0}  # Just a placeholder if something is missing
 
@@ -30,13 +26,7 @@ def compute_metrics(eval_pred: EvalPrediction):
 
     # we define "likelihood_i" = CE_i / (1 - p_i) 
     p = mask_probs
-    denom = np.clip(1.0 - p, 1e-9, 9999)
+    denom = torch.clip(1.0 - p, 1e-5, 9999)
     likelihoods = ce_per_seq / denom
-    mean_likelihood = likelihoods.mean().cpu().numpy()
 
-    metrics = {
-        "likelihood": float(mean_likelihood),
-        "perplexity": float(np.exp(mean_likelihood))
-    }
-
-    return metrics
+    return likelihoods

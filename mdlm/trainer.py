@@ -1,5 +1,4 @@
-import numpy as np
-import torch
+from math import exp
 from transformers import Trainer
 
 class MDLMTrainer(Trainer):
@@ -8,57 +7,22 @@ class MDLMTrainer(Trainer):
     Specifically, it passes mask probabilities to compute_metrics for cacluating PPL.
     """
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """
-        1) Do the standard forward pass with no grad.
-        2) Extract logits + labels.
-        3) Build an EvalInputs object that includes 'masking_probabilities'
-        4) Return a 4-tuple (loss, preds, labels, inputs) => the 4th item is stored in EvalPrediction.inputs
-        """
-        # Pop the masking probabilities from the batch
-        mask_probs = inputs.pop("masking_probabilities", None)
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            loss = outputs.loss if hasattr(outputs, "loss") else None
-            logits = outputs.logits if hasattr(outputs, "logits") else None
-
-        if prediction_loss_only:
-            return (loss, None, None)
-
-        # get logits and labels
-        # logits_np = logits.detach().cpu().numpy() if logits is not None else None
-        # labels_np = inputs["labels"].detach().cpu().numpy() if "labels" in inputs else None
-        logits = logits.detach() if logits is not None else None
-        labels = inputs["labels"].detach() if "labels" in inputs else None
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        # The main scalar for backprop:
+        loss = outputs["loss"]
         
-        # convert mask_probs to numpy
-        # if mask_probs is not None:
-        #     # It's typically a Python list => np.array
-        #     mask_probs_np = np.array(mask_probs, dtype=np.float32)
-        # else:
-        #     mask_probs_np = None
+        # Log extra losses if they exist
+        if False:
+            log_dict = {}
+            if "likelihood" in outputs:
+                llik = outputs["likelihood"].item()
+                log_dict.update({"likelihood": llik})
+            if "cross_entropy" in outputs:
+                log_dict.update({"cross_entropy": outputs["cross_entropy"].item()})
+            self.log(log_dict)
 
-        # Create our custom object
-        eval_inputs = EvalInputs(
-            masking_probabilities=mask_probs,
-            raw_input_ids=None # no need for raw input id's right now
-        )
-
-        # Return a 4-tuple => Trainer constructs EvalPrediction(...) with `inputs=custom_eval_inputs`
-        return loss, logits, labels, eval_inputs
-
-class EvalInputs:
-    """
-    An object to hold custom inputs for evaluation.
-      - masking_probabilities: np.ndarray of shape [batch_size]
-      - raw_input_ids: optional, could store the original input_ids (or None)
-    """
-    def __init__(self, masking_probabilities=None, raw_input_ids=None):
-        self.masking_probabilities = masking_probabilities
-        self.raw_input_ids = raw_input_ids
-
-    def __repr__(self):
-        # A quick string representation
-        return (f"EvalInputs(masking_probabilities={self.masking_probabilities}, "
-                f"raw_input_ids={self.raw_input_ids})")
+        # HF expects us to return a scalar loss (plus outputs optionally)
+        if return_outputs:
+            return (loss, outputs)
+        return loss
