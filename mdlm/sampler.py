@@ -2,21 +2,25 @@ from dataclasses import dataclass
 from typing import Optional
 from abc import ABC, abstractmethod
 import torch
+from mdlm.model.schedule import LogLinearSchedule
 
 @dataclass
 class SamplerConfig:
     """
-    Configuration for your sampler/diffusion parameters.
-    This can hold parameters for ancestral sampling, tau-leaping, etc.
+    Configuration for sampler/diffusion parameters.
+    Holds parameters for ancestral sampling, tau-leaping, etc.
     """
     # Common parameters
     num_steps: int = 1000
     num_samples: int = 8
-    # temperature: float = 1.0
+    num_tokens: int = 128 # total number of tokens to generate
+    temperature: float = 1.0 # currently not used
+    eps: float = 1e-5 # numerical precision
 
     # For ancestral sampling
-    mask_index: int = 0
-    use_cache: bool = True
+    mask_index: int = -1 # get it from model or throw error
+    use_cache: bool = True # cached mdlm sampler
+    schedule: str = "loglinear" # noise schedule
 
     # For tau-leaping sampling
     tau: float = 0.1
@@ -29,8 +33,8 @@ class BaseDiffusionSampler(ABC):
     def sample(
         self, 
         model, 
-        input_ids: torch.Tensor, 
-        sampler_config: SamplerConfig, 
+        config: SamplerConfig, 
+        input_ids: Optional[torch.Tensor], 
         **kwargs
     ) -> torch.Tensor:
         """
@@ -48,102 +52,81 @@ class BaseDiffusionSampler(ABC):
         pass
 
 class AncestralSampler(BaseDiffusionSampler):
-    def sample(self, model, input_ids, sampler_config: SamplerConfig, **kwargs):
+    def sample(
+            self, 
+            model, 
+            config: SamplerConfig, 
+            input_ids: Optional[torch.Tensor] = None, 
+            **kwargs
+        ):
         """
-        Example 'ancestral' approach that uses:
-          - sampler_config.num_samples
-          - sampler_config.num_steps
+        Ancestral sampler that uses:
+            - model: the discrete diffusion denoising model
+            - config: sampling configuration
+            - input_ids: initial prompt
         """
-        device = input_ids.device
-        output_ids = input_ids.clone()
-        for step in range(sampler_config.num_steps):
-            # Pseudo-code for re-masking, forward pass, sampling, etc.
-            pass
-        return output_ids
-    
-    def _sample_prior(self, *batch_dims):
-        return self.mask_index * torch.ones(
-            *batch_dims, dtype=torch.int64
-        )
-    
-    def _sample(self, num_samples, num_steps, use_cache=True, eps=1e-5):
-        """Generate samples from the model."""
-        x = self._sample_prior(
-            num_samples,
-            self.config.model.length
-        ).to(self.device)
+        # create first sample (config.num_samples x config.num_tokens)
+        zt = self._sample_prior(config, input_ids).to(model.device)
+        print(zt)
+
+        # set up sampling steps
         timesteps = torch.linspace(
-            1, eps, num_steps + 1, device=self.device
+            1, config.eps, config.num_steps + 1, device=model.device
         )
-        dt = (1 - eps) / num_steps
+        dt = (1 - config.eps) / config.num_steps
+        
+        # initialize schedule and caching
+        schedule = self._init_schedule(config)
         p_x0_cache = None
 
-        for i in range(num_steps):
-            t = timesteps[i] * torch.ones(
-                x.shape[0], 1, device=self.device)
-            if not use_cache:
-                x = self._ddpm_update(x, t, dt)
-            else:
-                p_x0_cache, x_next = self._ddpm_caching_update(
-                    x, t, dt, p_x0=p_x0_cache
-                )
-                if not torch.allclose(x_next, x):
-                    # Disable caching
-                    p_x0_cache = None
-                    x = x_next
+        # sample all the time steps
+        for i in range(config.num_steps):
+            t = timesteps[i] * torch.ones(zt.shape[0], device=model.device)
+            zt, p_x0_cache = self._sample_at_t(
+                model, schedule, config, zt, t, dt, p_x0_cache
+            )
 
-        # if self.config.sampling.noise_removal:
-        #     t = timesteps[-1] * torch.ones(x.shape[0], 1,
-        #                                     device=self.device)
-        x = self.forward(x).argmax(dim=-1)
-        return x
+        zt = model.forward(zt).logits.argmax(dim=-1)
+        return zt
+    
+    def _sample_at_t(self, model, schedule, config, zt, t, dt, p_x0=None):
+        # mask_chance_t is 1-\alpha_t in MDLM paper
+        # i.e. the cumulative probability at time t that a token is masked
+        mask_chance_t = schedule.cumulative(t)[:, None, None]
+        mask_chance_s = schedule.cumulative(t - dt)[:, None, None]
 
-    def _ddpm_caching_update(model, x, t, dt, p_x0=None):
-        # assert model.config.noise.type == 'loglinear'
-        # sigma_t, _ = model.noise(t)
-        if t.ndim > 1:
-            t = t.squeeze(-1)
-        assert t.ndim == 1
-        move_chance_t = t[:, None, None]
-        move_chance_s = (t - dt)[:, None, None]
-        assert move_chance_t.ndim == 3, move_chance_t.shape
-        if p_x0 is None:
-            p_x0 = model.forward(x).exp()
-        
-        assert move_chance_t.ndim == p_x0.ndim
-        q_xs = p_x0 * (move_chance_t - move_chance_s)
-        q_xs[:, :, model.mask_index] = move_chance_s[:, :, 0]
-        _x = _sample_categorical(q_xs)
-        
-        copy_flag = (x != model.mask_index).to(x.dtype)
-        return p_x0, copy_flag * x + (1 - copy_flag) * _x
+        if not config.use_cache or p_x0 is None:
+            p_x0 = model.forward(input_ids=zt).logits.exp()
 
-    def _ddpm_update(model, x, t, dt):
-        sigma_t, _ = model.noise(t)
-        sigma_s, _ = model.noise(t - dt)
-        if sigma_t.ndim > 1:
-            sigma_t = sigma_t.squeeze(-1)
-        if sigma_s.ndim > 1:
-            sigma_s = sigma_s.squeeze(-1)
-        assert sigma_t.ndim == 1, sigma_t.shape
-        assert sigma_s.ndim == 1, sigma_s.shape
-        move_chance_t = 1 - torch.exp(-sigma_t)
-        move_chance_s = 1 - torch.exp(-sigma_s)
-        move_chance_t = move_chance_t[:, None, None]
-        move_chance_s = move_chance_s[:, None, None]
-        unet_conditioning = sigma_t
-        log_p_x0 = model.forward(x, unet_conditioning)
-        assert move_chance_t.ndim == log_p_x0.ndim
-        # Technically, this isn't q_xs since there's a division
-        # term that is missing. This division term doesn't affect
-        # the samples.
-        q_xs = log_p_x0.exp() * (move_chance_t
-                                - move_chance_s)
-        q_xs[:, :, model.mask_index] = move_chance_s[:, :, 0]
-        _x = _sample_categorical(q_xs)
+        # this samples from q(zs|zt,x_\theta(zt)), i.e. (6) in the MDLM paper
+        q_zs = p_x0 * (mask_chance_t - mask_chance_s) # up to a constant
+        q_zs[:, :, config.mask_index] = mask_chance_s[:, :, 0]
+        _zs = _sample_categorical(q_zs)
 
-        copy_flag = (x != model.mask_index).to(x.dtype)
-        return copy_flag * x + (1 - copy_flag) * _x
+        copy_flag = (zt != config.mask_index).to(zt.dtype)
+        zs = copy_flag * zt + (1 - copy_flag) * _zs
+
+        if not torch.allclose(zs, zt):
+            # do not return cached values
+            p_x0 = None
+
+        return zs, p_x0
+    
+    def _sample_prior(self, config, input_ids=None):
+        zT = config.mask_index * torch.ones(
+            config.num_samples, 
+            config.num_tokens, 
+            dtype=torch.int64
+        )
+        if input_ids is not None:
+            zT[:, :input_ids.shape[1]] = input_ids
+        return zT
+    
+    def _init_schedule(self, config):
+        if config.schedule == "loglinear":
+            return LogLinearSchedule(eps=config.eps)
+        else:
+            raise ValueError(f"Unknown schedule: {config.schedule}")
 
 class TauLeapingSampler(BaseDiffusionSampler):
     def sample(self, model, input_ids, sampler_config: SamplerConfig, **kwargs):
@@ -160,7 +143,5 @@ class TauLeapingSampler(BaseDiffusionSampler):
         return output_ids
 
 def _sample_categorical(categorical_probs):
-  gumbel_norm = (
-    1e-10
-    - (torch.rand_like(categorical_probs) + 1e-10).log())
-  return (categorical_probs / gumbel_norm).argmax(dim=-1)
+    gumbel_norm = (1e-10- (torch.rand_like(categorical_probs) + 1e-10).log())
+    return (categorical_probs / gumbel_norm).argmax(dim=-1)

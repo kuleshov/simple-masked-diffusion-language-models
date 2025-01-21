@@ -178,7 +178,7 @@ class AutoModelForMaskedDiffusionLM(PreTrainedModel):
 
     def generate(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         sampler_config: Optional[SamplerConfig] = None,
         sampler_class: str = "ancestral",
         **kwargs
@@ -197,27 +197,21 @@ class AutoModelForMaskedDiffusionLM(PreTrainedModel):
         """
         if sampler_config is None:
             # fallback to default config
-            sampler_config = SamplerConfig(sampler_name=sampler_class)
-        else:
-            # overwrite the sampler_name with what's passed
-            sampler_config.sampler_name = sampler_class
+            sampler_config = SamplerConfig()
 
-        # 1) Create the sampler instance
-        sampler = self._create_sampler(sampler_config)
-
-        # 2) Delegate sampling
-        generated_output = sampler.sample(self, input_ids, sampler_config, **kwargs)
+        sampler = self._create_sampler(sampler_class)
+        generated_output = sampler.sample(self, sampler_config, input_ids, **kwargs)
+        
         return generated_output
 
-    def _create_sampler(self, sampler_config: SamplerConfig) -> BaseDiffusionSampler:
+    def _create_sampler(self, sampler_class: str) -> BaseDiffusionSampler:
         """
         A helper method that instantiates the correct sampler 
         based on sampler_config.sampler_name.
         """
-        sampler_name = sampler_config.sampler_name.lower()
-        if sampler_name == "ancestral":
+        if sampler_class == "ancestral":
             return AncestralSampler()
-        elif sampler_name == "tau_leaping":
+        elif sampler_class == "tau_leaping":
             return TauLeapingSampler()
         else:
-            raise ValueError(f"Unknown sampler: {sampler_name}")
+            raise ValueError(f"Unknown sampler: {sampler_class}")
